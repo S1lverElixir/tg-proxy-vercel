@@ -5,14 +5,14 @@
 // Расширение .mjs — чтобы не создавать отдельный package.json с "type": "module".
 //
 // ВАЖНО ПРО ПУТЬ ФАЙЛА: этот файл должен лежать ровно по пути
-//   api/proxy/[...path].mjs
+// api/proxy/[...path].mjs
 // (включая квадратные скобки и три точки в имени файла — это специальный
 // "catch-all"-синтаксис Vercel, он подхватывает ЛЮБОЙ путь после /api/proxy/,
 // например /api/proxy/bot<ТОКЕН>/getMe). Создавая файл через веб-интерфейс GitHub,
 // можно ввести весь этот путь целиком в поле имени файла — папки создадутся сами.
 //
 // Поэтому TELEGRAM_API_BASE_URL на стороне бота должен быть:
-//   https://<твой-проект>.vercel.app/api/proxy
+// https://<твой-проект>.vercel.app/api/proxy
 // (bot.py сам допишет дальше "/bot<ТОКЕН>/<метод>" при каждом вызове).
 
 const TIMEOUT_MS = 20000;
@@ -52,10 +52,29 @@ async function relay(request) {
   try {
     const upstream = await fetch(targetUrl, init);
     clearTimeout(timer);
+
+    // ВАЖНО: Node.js fetch() (undici) сам прозрачно распаковывает gzip/br-ответы
+    // upstream'а — то есть upstream.body, который мы отдаём дальше, это уже
+    // РАСПАКОВАННЫЕ байты. Но upstream.headers при этом всё ещё содержит
+    // ОРИГИНАЛЬНЫЕ content-encoding/content-length от Telegram (для сжатого,
+    // ещё не распакованного тела) — это задокументированный gotcha самого
+    // fetch()/undici (whatwg/fetch issue #1729, nodejs/undici issue #2514),
+    // спецификация не обязывает чистить эти заголовки при автораспаковке.
+    // Если пробросить их как есть — клиент (aiohttp в bot.py) получает тело
+    // без сжатия, но заголовок "content-encoding: gzip" всё ещё стоит, пытается
+    // распаковать его повторно и либо ловит ошибку, либо получает мусор вместо
+    // JSON. Именно это и было источником периодических "Expecting value: line 1
+    // column 1" в логах бота — проявлялось не всегда, а только когда ответ
+    // Telegram оказывался достаточно большим, чтобы Telegram сам сжал его gzip'ом.
+    const responseHeaders = new Headers(upstream.headers);
+    responseHeaders.delete("content-encoding");
+    responseHeaders.delete("content-length");
+    responseHeaders.delete("transfer-encoding");
+
     return new Response(upstream.body, {
       status: upstream.status,
       statusText: upstream.statusText,
-      headers: upstream.headers,
+      headers: responseHeaders,
     });
   } catch (err) {
     clearTimeout(timer);
