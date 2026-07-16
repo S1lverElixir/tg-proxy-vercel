@@ -53,25 +53,29 @@ async function relay(request) {
     const upstream = await fetch(targetUrl, init);
     clearTimeout(timer);
 
-    // ВАЖНО: Node.js fetch() (undici) сам прозрачно распаковывает gzip/br-ответы
-    // upstream'а — то есть upstream.body, который мы отдаём дальше, это уже
-    // РАСПАКОВАННЫЕ байты. Но upstream.headers при этом всё ещё содержит
-    // ОРИГИНАЛЬНЫЕ content-encoding/content-length от Telegram (для сжатого,
-    // ещё не распакованного тела) — это задокументированный gotcha самого
-    // fetch()/undici (whatwg/fetch issue #1729, nodejs/undici issue #2514),
-    // спецификация не обязывает чистить эти заголовки при автораспаковке.
-    // Если пробросить их как есть — клиент (aiohttp в bot.py) получает тело
-    // без сжатия, но заголовок "content-encoding: gzip" всё ещё стоит, пытается
-    // распаковать его повторно и либо ловит ошибку, либо получает мусор вместо
-    // JSON. Именно это и было источником периодических "Expecting value: line 1
-    // column 1" в логах бота — проявлялось не всегда, а только когда ответ
-    // Telegram оказывался достаточно большим, чтобы Telegram сам сжал его gzip'ом.
+    // ВАЖНО: тело читаем ЦЕЛИКОМ через arrayBuffer(), а не пробрасываем
+    // upstream.body как поток дальше. Ответы Telegram — это доли килобайт,
+    // буферизация ничего не стоит по времени, зато убирает сразу два реальных
+    // источника битых ответов клиенту (bot.py получал пустое тело / JSONDecodeError
+    // "Expecting value: line 1 column 1"):
+    // 1) поток от upstream мог обрываться раньше времени именно на "холодном"
+    //    старте инстанса Vercel, когда соединение edge-сеть↔рантайм ещё не
+    //    полностью прогрето — clientу в этом случае прилетало пустое тело;
+    // 2) Node.js fetch() сам прозрачно распаковывает gzip/br у upstream-ответа,
+    //    но upstream.headers при этом всё ещё содержит ОРИГИНАЛЬНЫЕ
+    //    content-encoding/content-length от Telegram (для ещё сжатого тела) —
+    //    задокументированный gotcha самого fetch()/undici (whatwg/fetch #1729,
+    //    nodejs/undici #2514). Пробрасывая их как есть, клиент получал тело
+    //    без сжатия, но заголовок "content-encoding: gzip" всё ещё стоял —
+    //    и пытался распаковать уже распакованное.
+    const buf = await upstream.arrayBuffer();
+
     const responseHeaders = new Headers(upstream.headers);
     responseHeaders.delete("content-encoding");
     responseHeaders.delete("content-length");
     responseHeaders.delete("transfer-encoding");
 
-    return new Response(upstream.body, {
+    return new Response(buf, {
       status: upstream.status,
       statusText: upstream.statusText,
       headers: responseHeaders,
