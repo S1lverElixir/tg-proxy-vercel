@@ -1,19 +1,9 @@
 // tg-proxy — прозрачный релей запросов к Telegram Bot API для Vercel Functions
-// (Node.js runtime — стандартный/рекомендованный рантайм Vercel Functions,
-// Edge Functions официально deprecated с 2026 года).
+// (Node.js runtime, .mjs без отдельного package.json).
 //
-// Расширение .mjs — чтобы не создавать отдельный package.json с "type": "module".
-//
-// ВАЖНО ПРО ПУТЬ ФАЙЛА: этот файл должен лежать ровно по пути
-// api/proxy/[...path].mjs
-// (включая квадратные скобки и три точки в имени файла — это специальный
-// "catch-all"-синтаксис Vercel, он подхватывает ЛЮБОЙ путь после /api/proxy/,
-// например /api/proxy/bot<ТОКЕН>/getMe). Создавая файл через веб-интерфейс GitHub,
-// можно ввести весь этот путь целиком в поле имени файла — папки создадутся сами.
-//
-// Поэтому TELEGRAM_API_BASE_URL на стороне бота должен быть:
-// https://<твой-проект>.vercel.app/api/proxy
-// (bot.py сам допишет дальше "/bot<ТОКЕН>/<метод>" при каждом вызове).
+// api/proxy/[...path].mjs — catch-all путь, ловит всё после /api/proxy/.
+// TELEGRAM_API_BASE_URL на стороне бота: https://<проект>.vercel.app/api/proxy
+// (bot.py сам допишет "/bot<ТОКЕН>/<метод>" при каждом вызове).
 
 const TIMEOUT_MS = 20000;
 const PREFIX = "/api/proxy";
@@ -25,9 +15,6 @@ async function relay(request) {
     : incoming.pathname;
   const targetUrl = "https://api.telegram.org" + relayPath + incoming.search;
 
-  // Убираем заголовки, которые нельзя/не нужно пробрасывать руками при
-  // формировании нового исходящего запроса — fetch сам корректно проставит их
-  // под целевой хост.
   const headers = new Headers(request.headers);
   headers.delete("host");
   headers.delete("content-length");
@@ -43,37 +30,41 @@ async function relay(request) {
     body: hasBody ? request.body : undefined,
     signal: controller.signal,
   };
-  // duplex:"half" обязателен спецификацией fetch при передаче потокового тела —
-  // без него современные рантаймы кидают ошибку "duplex option is required".
   if (hasBody) {
     init.duplex = "half";
   }
+
+  // Логируем КАЖДЫЙ запрос — до сих пор Logs были пустыми просто потому,
+  // что в коде не было ни одного console.log. Без этого невозможно понять,
+  // что реально приходит от Telegram при сбоях — приходится гадать вслепую.
+  // relayPath без query-параметров (там токен) — безопасно светить в логах.
+  console.log(`[tg-proxy] -> ${request.method} ${relayPath}`);
 
   try {
     const upstream = await fetch(targetUrl, init);
     clearTimeout(timer);
 
-    // ВАЖНО: тело читаем ЦЕЛИКОМ через arrayBuffer(), а не пробрасываем
-    // upstream.body как поток дальше. Ответы Telegram — это доли килобайт,
-    // буферизация ничего не стоит по времени, зато убирает сразу два реальных
-    // источника битых ответов клиенту (bot.py получал пустое тело / JSONDecodeError
-    // "Expecting value: line 1 column 1"):
-    // 1) поток от upstream мог обрываться раньше времени именно на "холодном"
-    //    старте инстанса Vercel, когда соединение edge-сеть↔рантайм ещё не
-    //    полностью прогрето — clientу в этом случае прилетало пустое тело;
-    // 2) Node.js fetch() сам прозрачно распаковывает gzip/br у upstream-ответа,
-    //    но upstream.headers при этом всё ещё содержит ОРИГИНАЛЬНЫЕ
-    //    content-encoding/content-length от Telegram (для ещё сжатого тела) —
-    //    задокументированный gotcha самого fetch()/undici (whatwg/fetch #1729,
-    //    nodejs/undici #2514). Пробрасывая их как есть, клиент получал тело
-    //    без сжатия, но заголовок "content-encoding: gzip" всё ещё стоял —
-    //    и пытался распаковать уже распакованное.
     const buf = await upstream.arrayBuffer();
+    const bodyText = Buffer.from(buf).toString("utf-8");
 
     const responseHeaders = new Headers(upstream.headers);
     responseHeaders.delete("content-encoding");
     responseHeaders.delete("content-length");
     responseHeaders.delete("transfer-encoding");
+
+    // Проверяем валидность JSON ДО отдачи клиенту — если невалиден, логируем
+    // сырое тело (до 500 символов), чтобы в Vercel Logs было видно, что именно
+    // вернулось в этом случае, а не просто "что-то пошло не так".
+    let isValidJson = true;
+    try {
+      JSON.parse(bodyText);
+    } catch {
+      isValidJson = false;
+    }
+    console.log(
+      `[tg-proxy] <- status=${upstream.status} bytes=${buf.byteLength} validJson=${isValidJson}` +
+      (isValidJson ? "" : ` rawBody="${bodyText.slice(0, 500)}"`)
+    );
 
     return new Response(buf, {
       status: upstream.status,
@@ -86,9 +77,7 @@ async function relay(request) {
     const message = isTimeout
       ? `tg-proxy: upstream (api.telegram.org) не ответил за ${TIMEOUT_MS}мс`
       : `tg-proxy: ошибка запроса к upstream: ${String(err)}`;
-    // Валидный JSON в форме, похожей на ошибку Telegram API (ok:false), а не сырой
-    // текст/HTML — именно сырой не-JSON ответ прокси уже один раз ломал бота
-    // (JSONDecodeError на стороне bot.py при падении прежнего прокси на Deno).
+    console.error(`[tg-proxy] ERROR: ${message}`, err && err.stack);
     return new Response(JSON.stringify({ ok: false, error_code: 504, description: message }), {
       status: 504,
       headers: { "content-type": "application/json" },
